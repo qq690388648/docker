@@ -10,26 +10,31 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/distribution/digest"
 	"github.com/docker/docker/api"
-	"github.com/docker/docker/api/types"
-	containertypes "github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	registrytypes "github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/api/types/strslice"
+	"github.com/docker/docker/builder"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/events"
 	"github.com/docker/docker/daemon/exec"
 	"github.com/docker/docker/daemon/execdriver"
 	"github.com/docker/docker/daemon/execdriver/execdrivers"
+	"github.com/docker/engine-api/types"
+	containertypes "github.com/docker/engine-api/types/container"
+	eventtypes "github.com/docker/engine-api/types/events"
+	"github.com/docker/engine-api/types/filters"
+	networktypes "github.com/docker/engine-api/types/network"
+	registrytypes "github.com/docker/engine-api/types/registry"
+	"github.com/docker/engine-api/types/strslice"
 	// register graph drivers
 	_ "github.com/docker/docker/daemon/graphdriver/register"
 	"github.com/docker/docker/daemon/logger"
@@ -37,20 +42,20 @@ import (
 	"github.com/docker/docker/distribution"
 	dmetadata "github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/distribution/xfer"
+	"github.com/docker/docker/dockerversion"
 	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/image/tarexport"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/migrate/v1"
 	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/discovery"
 	"github.com/docker/docker/pkg/fileutils"
 	"github.com/docker/docker/pkg/graphdb"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/namesgenerator"
 	"github.com/docker/docker/pkg/progress"
+	"github.com/docker/docker/pkg/registrar"
 	"github.com/docker/docker/pkg/signal"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/stringid"
@@ -97,46 +102,11 @@ func (e ErrImageDoesNotExist) Error() string {
 	return fmt.Sprintf("no such id: %s", e.RefOrID)
 }
 
-type contStore struct {
-	s map[string]*container.Container
-	sync.Mutex
-}
-
-func (c *contStore) Add(id string, cont *container.Container) {
-	c.Lock()
-	c.s[id] = cont
-	c.Unlock()
-}
-
-func (c *contStore) Get(id string) *container.Container {
-	c.Lock()
-	res := c.s[id]
-	c.Unlock()
-	return res
-}
-
-func (c *contStore) Delete(id string) {
-	c.Lock()
-	delete(c.s, id)
-	c.Unlock()
-}
-
-func (c *contStore) List() []*container.Container {
-	containers := new(History)
-	c.Lock()
-	for _, cont := range c.s {
-		containers.Add(cont)
-	}
-	c.Unlock()
-	containers.sort()
-	return *containers
-}
-
 // Daemon holds information about the Docker daemon.
 type Daemon struct {
 	ID                        string
 	repository                string
-	containers                *contStore
+	containers                container.Store
 	execCommands              *exec.Store
 	referenceStore            reference.Store
 	downloadManager           *xfer.LayerDownloadManager
@@ -145,7 +115,6 @@ type Daemon struct {
 	trustKey                  libtrust.PrivateKey
 	idIndex                   *truncindex.TruncIndex
 	configStore               *Config
-	containerGraphDB          *graphdb.Database
 	execDriver                execdriver.Driver
 	statsCollector            *statsCollector
 	defaultLogConfig          containertypes.LogConfig
@@ -153,13 +122,16 @@ type Daemon struct {
 	EventsService             *events.Events
 	netController             libnetwork.NetworkController
 	volumes                   *store.VolumeStore
-	discoveryWatcher          discovery.Watcher
+	discoveryWatcher          discoveryReloader
 	root                      string
+	seccompEnabled            bool
 	shutdown                  bool
 	uidMaps                   []idtools.IDMap
 	gidMaps                   []idtools.IDMap
 	layerStore                layer.Store
 	imageStore                image.Store
+	nameIndex                 *registrar.Registrar
+	linkIndex                 *linkIndex
 }
 
 // GetContainer looks for a container using the provided information, which could be
@@ -243,8 +215,7 @@ func (daemon *Daemon) registerName(container *container.Container) error {
 			logrus.Errorf("Error saving container name to disk: %v", err)
 		}
 	}
-
-	return nil
+	return daemon.nameIndex.Reserve(container.Name, container.ID)
 }
 
 // Register makes a container object usable by the daemon as <container.ID>
@@ -255,10 +226,8 @@ func (daemon *Daemon) Register(container *container.Container) error {
 	} else {
 		container.NewNopInputPipe()
 	}
-	daemon.containers.Add(container.ID, container)
 
-	// don't update the Suffixarray if we're starting up
-	// we'll waste time if we update it for every container
+	daemon.containers.Add(container.ID, container)
 	daemon.idIndex.Add(container.ID)
 
 	if container.IsRunning() {
@@ -281,23 +250,14 @@ func (daemon *Daemon) Register(container *container.Container) error {
 		}
 	}
 
-	if err := daemon.prepareMountPoints(container); err != nil {
-		return err
-	}
-
 	return nil
 }
 
 func (daemon *Daemon) restore() error {
-	type cr struct {
-		container  *container.Container
-		registered bool
-	}
-
 	var (
-		debug         = os.Getenv("DEBUG") != ""
+		debug         = utils.IsDebugEnabled()
 		currentDriver = daemon.GraphDriverName()
-		containers    = make(map[string]*cr)
+		containers    = make(map[string]*container.Container)
 	)
 
 	if !debug {
@@ -319,73 +279,120 @@ func (daemon *Daemon) restore() error {
 			continue
 		}
 
-		rwlayer, err := daemon.layerStore.GetRWLayer(container.ID)
-		if err != nil {
-			logrus.Errorf("Failed to load container mount %v: %v", id, err)
-			continue
-		}
-		container.RWLayer = rwlayer
-
 		// Ignore the container if it does not support the current driver being used by the graph
 		if (container.Driver == "" && currentDriver == "aufs") || container.Driver == currentDriver {
+			rwlayer, err := daemon.layerStore.GetRWLayer(container.ID)
+			if err != nil {
+				logrus.Errorf("Failed to load container mount %v: %v", id, err)
+				continue
+			}
+			container.RWLayer = rwlayer
 			logrus.Debugf("Loaded container %v", container.ID)
 
-			containers[container.ID] = &cr{container: container}
+			containers[container.ID] = container
 		} else {
 			logrus.Debugf("Cannot load container %s because it was created with another graph driver.", container.ID)
 		}
 	}
 
-	if entities := daemon.containerGraphDB.List("/", -1); entities != nil {
-		for _, p := range entities.Paths() {
-			if !debug && logrus.GetLevel() == logrus.InfoLevel {
-				fmt.Print(".")
-			}
+	var migrateLegacyLinks bool
+	restartContainers := make(map[*container.Container]chan struct{})
+	for _, c := range containers {
+		if err := daemon.registerName(c); err != nil {
+			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
+			continue
+		}
+		if err := daemon.Register(c); err != nil {
+			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
+			continue
+		}
 
-			e := entities[p]
+		// get list of containers we need to restart
+		if daemon.configStore.AutoRestart && c.ShouldRestart() {
+			restartContainers[c] = make(chan struct{})
+		}
 
-			if c, ok := containers[e.ID()]; ok {
-				c.registered = true
+		// if c.hostConfig.Links is nil (not just empty), then it is using the old sqlite links and needs to be migrated
+		if c.HostConfig != nil && c.HostConfig.Links == nil {
+			migrateLegacyLinks = true
+		}
+	}
+
+	// migrate any legacy links from sqlite
+	linkdbFile := filepath.Join(daemon.root, "linkgraph.db")
+	var legacyLinkDB *graphdb.Database
+	if migrateLegacyLinks {
+		legacyLinkDB, err = graphdb.NewSqliteConn(linkdbFile)
+		if err != nil {
+			return fmt.Errorf("error connecting to legacy link graph DB %s, container links may be lost: %v", linkdbFile, err)
+		}
+		defer legacyLinkDB.Close()
+	}
+
+	// Now that all the containers are registered, register the links
+	for _, c := range containers {
+		if migrateLegacyLinks {
+			if err := daemon.migrateLegacySqliteLinks(legacyLinkDB, c); err != nil {
+				return err
 			}
+		}
+		if err := daemon.registerLinks(c, c.HostConfig); err != nil {
+			logrus.Errorf("failed to register link for container %s: %v", c.ID, err)
 		}
 	}
 
 	group := sync.WaitGroup{}
-	for _, c := range containers {
+	for c, notifier := range restartContainers {
 		group.Add(1)
 
-		go func(container *container.Container, registered bool) {
+		go func(c *container.Container, chNotify chan struct{}) {
 			defer group.Done()
 
-			if !registered {
-				// Try to set the default name for a container if it exists prior to links
-				container.Name, err = daemon.generateNewName(container.ID)
-				if err != nil {
-					logrus.Debugf("Setting default id - %s", err)
+			logrus.Debugf("Starting container %s", c.ID)
+
+			// ignore errors here as this is a best effort to wait for children to be
+			//   running before we try to start the container
+			children := daemon.children(c)
+			timeout := time.After(5 * time.Second)
+			for _, child := range children {
+				if notifier, exists := restartContainers[child]; exists {
+					select {
+					case <-notifier:
+					case <-timeout:
+					}
 				}
 			}
-			if err := daemon.registerName(container); err != nil {
-				logrus.Errorf("Failed to register container %s: %s", container.ID, err)
-				return
+			if err := daemon.containerStart(c); err != nil {
+				logrus.Errorf("Failed to start container %s: %s", c.ID, err)
 			}
+			close(chNotify)
+		}(c, notifier)
 
-			if err := daemon.Register(container); err != nil {
-				logrus.Errorf("Failed to register container %s: %s", container.ID, err)
-				// The container register failed should not be started.
-				return
-			}
-
-			// check the restart policy on the containers and restart any container with
-			// the restart policy of "always"
-			if daemon.configStore.AutoRestart && container.ShouldRestart() {
-				logrus.Debugf("Starting container %s", container.ID)
-
-				if err := daemon.containerStart(container); err != nil {
-					logrus.Errorf("Failed to start container %s: %s", container.ID, err)
-				}
-			}
-		}(c.container, c.registered)
 	}
+	group.Wait()
+
+	// any containers that were started above would already have had this done,
+	// however we need to now prepare the mountpoints for the rest of the containers as well.
+	// This shouldn't cause any issue running on the containers that already had this run.
+	// This must be run after any containers with a restart policy so that containerized plugins
+	// can have a chance to be running before we try to initialize them.
+	for _, c := range containers {
+		// if the container has restart policy, do not
+		// prepare the mountpoints since it has been done on restarting.
+		// This is to speed up the daemon start when a restart container
+		// has a volume and the volume dirver is not available.
+		if _, ok := restartContainers[c]; ok {
+			continue
+		}
+		group.Add(1)
+		go func(c *container.Container) {
+			defer group.Done()
+			if err := daemon.prepareMountPoints(c); err != nil {
+				logrus.Error(err)
+			}
+		}(c)
+	}
+
 	group.Wait()
 
 	if !debug {
@@ -400,7 +407,7 @@ func (daemon *Daemon) restore() error {
 
 func (daemon *Daemon) mergeAndVerifyConfig(config *containertypes.Config, img *image.Image) error {
 	if img != nil && img.Config != nil {
-		if err := runconfig.Merge(config, img.Config); err != nil {
+		if err := merge(config, img.Config); err != nil {
 			return err
 		}
 	}
@@ -434,26 +441,26 @@ func (daemon *Daemon) reserveName(id, name string) (string, error) {
 	if !validContainerNamePattern.MatchString(name) {
 		return "", fmt.Errorf("Invalid container name (%s), only %s are allowed", name, validContainerNameChars)
 	}
-
 	if name[0] != '/' {
 		name = "/" + name
 	}
 
-	if _, err := daemon.containerGraphDB.Set(name, id); err != nil {
-		if !graphdb.IsNonUniqueNameError(err) {
-			return "", err
+	if err := daemon.nameIndex.Reserve(name, id); err != nil {
+		if err == registrar.ErrNameReserved {
+			id, err := daemon.nameIndex.Get(name)
+			if err != nil {
+				logrus.Errorf("got unexpected error while looking up reserved name: %v", err)
+				return "", err
+			}
+			return "", fmt.Errorf("Conflict. The name %q is already in use by container %s. You have to remove (or rename) that container to be able to reuse that name.", name, id)
 		}
-
-		conflictingContainer, err := daemon.GetByName(name)
-		if err != nil {
-			return "", err
-		}
-		return "", fmt.Errorf(
-			"Conflict. The name %q is already in use by container %s. You have to remove (or rename) that container to be able to reuse that name.", strings.TrimPrefix(name, "/"),
-			stringid.TruncateID(conflictingContainer.ID))
-
+		return "", fmt.Errorf("error reserving name: %s, error: %v", name, err)
 	}
 	return name, nil
+}
+
+func (daemon *Daemon) releaseName(name string) {
+	daemon.nameIndex.Release(name)
 }
 
 func (daemon *Daemon) generateNewName(id string) (string, error) {
@@ -464,17 +471,17 @@ func (daemon *Daemon) generateNewName(id string) (string, error) {
 			name = "/" + name
 		}
 
-		if _, err := daemon.containerGraphDB.Set(name, id); err != nil {
-			if !graphdb.IsNonUniqueNameError(err) {
-				return "", err
+		if err := daemon.nameIndex.Reserve(name, id); err != nil {
+			if err == registrar.ErrNameReserved {
+				continue
 			}
-			continue
+			return "", err
 		}
 		return name, nil
 	}
 
 	name = "/" + stringid.TruncateID(id)
-	if _, err := daemon.containerGraphDB.Set(name, id); err != nil {
+	if err := daemon.nameIndex.Reserve(name, id); err != nil {
 		return "", err
 	}
 	return name, nil
@@ -524,53 +531,26 @@ func (daemon *Daemon) newContainer(name string, config *containertypes.Config, i
 	return base, err
 }
 
-// GetFullContainerName returns a constructed container name. I think
-// it has to do with the fact that a container is a file on disk and
-// this is sort of just creating a file name.
-func GetFullContainerName(name string) (string, error) {
-	if name == "" {
-		return "", fmt.Errorf("Container name cannot be empty")
-	}
-	if name[0] != '/' {
-		name = "/" + name
-	}
-	return name, nil
-}
-
 // GetByName returns a container given a name.
 func (daemon *Daemon) GetByName(name string) (*container.Container, error) {
-	fullName, err := GetFullContainerName(name)
-	if err != nil {
-		return nil, err
+	fullName := name
+	if name[0] != '/' {
+		fullName = "/" + name
 	}
-	entity := daemon.containerGraphDB.Get(fullName)
-	if entity == nil {
+	id, err := daemon.nameIndex.Get(fullName)
+	if err != nil {
 		return nil, fmt.Errorf("Could not find entity for %s", name)
 	}
-	e := daemon.containers.Get(entity.ID())
+	e := daemon.containers.Get(id)
 	if e == nil {
-		return nil, fmt.Errorf("Could not find container for entity id %s", entity.ID())
+		return nil, fmt.Errorf("Could not find container for entity id %s", id)
 	}
 	return e, nil
 }
 
-// getEventFilter returns a filters.Filter for a set of filters
-func (daemon *Daemon) getEventFilter(filter filters.Args) *events.Filter {
-	// incoming container filter can be name, id or partial id, convert to
-	// a full container id
-	for _, cn := range filter.Get("container") {
-		c, err := daemon.GetContainer(cn)
-		filter.Del("container", cn)
-		if err == nil {
-			filter.Add("container", c.ID)
-		}
-	}
-	return events.NewFilter(filter, daemon.GetLabels)
-}
-
 // SubscribeToEvents returns the currently record of events, a channel to stream new events from, and a function to cancel the stream of events.
-func (daemon *Daemon) SubscribeToEvents(since, sinceNano int64, filter filters.Args) ([]*jsonmessage.JSONMessage, chan interface{}) {
-	ef := daemon.getEventFilter(filter)
+func (daemon *Daemon) SubscribeToEvents(since, sinceNano int64, filter filters.Args) ([]eventtypes.Message, chan interface{}) {
+	ef := events.NewFilter(filter)
 	return daemon.EventsService.SubscribeTopic(since, sinceNano, ef)
 }
 
@@ -595,48 +575,26 @@ func (daemon *Daemon) GetLabels(id string) map[string]string {
 	return nil
 }
 
-// children returns all child containers of the container with the
-// given name. The containers are returned as a map from the container
-// name to a pointer to Container.
-func (daemon *Daemon) children(name string) (map[string]*container.Container, error) {
-	name, err := GetFullContainerName(name)
-	if err != nil {
-		return nil, err
-	}
-	children := make(map[string]*container.Container)
-
-	err = daemon.containerGraphDB.Walk(name, func(p string, e *graphdb.Entity) error {
-		c, err := daemon.GetContainer(e.ID())
-		if err != nil {
-			return err
-		}
-		children[p] = c
-		return nil
-	}, 0)
-
-	if err != nil {
-		return nil, err
-	}
-	return children, nil
+func (daemon *Daemon) children(c *container.Container) map[string]*container.Container {
+	return daemon.linkIndex.children(c)
 }
 
 // parents returns the names of the parent containers of the container
 // with the given name.
-func (daemon *Daemon) parents(name string) ([]string, error) {
-	name, err := GetFullContainerName(name)
-	if err != nil {
-		return nil, err
-	}
-
-	return daemon.containerGraphDB.Parents(name)
+func (daemon *Daemon) parents(c *container.Container) map[string]*container.Container {
+	return daemon.linkIndex.parents(c)
 }
 
 func (daemon *Daemon) registerLink(parent, child *container.Container, alias string) error {
-	fullName := filepath.Join(parent.Name, alias)
-	if !daemon.containerGraphDB.Exists(fullName) {
-		_, err := daemon.containerGraphDB.Set(fullName, child.ID)
+	fullName := path.Join(parent.Name, alias)
+	if err := daemon.nameIndex.Reserve(fullName, child.ID); err != nil {
+		if err == registrar.ErrNameReserved {
+			logrus.Warnf("error registering link for %s, to %s, as alias %s, ignoring: %v", parent.ID, child.ID, alias, err)
+			return nil
+		}
 		return err
 	}
+	daemon.linkIndex.link(parent, child, fullName)
 	return nil
 }
 
@@ -645,8 +603,8 @@ func (daemon *Daemon) registerLink(parent, child *container.Container, alias str
 func NewDaemon(config *Config, registryService *registry.Service) (daemon *Daemon, err error) {
 	setDefaultMtu(config)
 
-	// Ensure we have compatible configuration options
-	if err := checkConfigOptions(config); err != nil {
+	// Ensure we have compatible and valid configuration options
+	if err := verifyDaemonSettings(config); err != nil {
 		return nil, err
 	}
 
@@ -720,6 +678,10 @@ func NewDaemon(config *Config, registryService *registry.Service) (daemon *Daemo
 		}
 	}
 	logrus.Debugf("Using default logging driver %s", config.LogConfig.Type)
+
+	if err := configureMaxThreads(config); err != nil {
+		logrus.Warnf("Failed to configure golang's threads limit: %v", err)
+	}
 
 	daemonRepo := filepath.Join(config.Root, "containers")
 	if err := idtools.MkdirAllAs(daemonRepo, 0700, rootUID, rootGID); err != nil && !os.IsExist(err) {
@@ -796,39 +758,22 @@ func NewDaemon(config *Config, registryService *registry.Service) (daemon *Daemo
 		return nil, fmt.Errorf("Couldn't restore custom images: %s", err)
 	}
 
+	migrationStart := time.Now()
 	if err := v1.Migrate(config.Root, graphDriver, d.layerStore, d.imageStore, referenceStore, distributionMetadataStore); err != nil {
 		return nil, err
 	}
+	logrus.Infof("Graph migration to content-addressability took %.2f seconds", time.Since(migrationStart).Seconds())
 
 	// Discovery is only enabled when the daemon is launched with an address to advertise.  When
 	// initialized, the daemon is registered and we can store the discovery backend as its read-only
-	// DiscoveryWatcher version.
-	if config.ClusterStore != "" && config.ClusterAdvertise != "" {
-		advertise, err := discovery.ParseAdvertise(config.ClusterStore, config.ClusterAdvertise)
-		if err != nil {
-			return nil, fmt.Errorf("discovery advertise parsing failed (%v)", err)
-		}
-		config.ClusterAdvertise = advertise
-		d.discoveryWatcher, err = initDiscovery(config.ClusterStore, config.ClusterAdvertise, config.ClusterOpts)
-		if err != nil {
-			return nil, fmt.Errorf("discovery initialization failed (%v)", err)
-		}
-	} else if config.ClusterAdvertise != "" {
-		return nil, fmt.Errorf("invalid cluster configuration. --cluster-advertise must be accompanied by --cluster-store configuration")
+	if err := d.initDiscovery(config); err != nil {
+		return nil, err
 	}
 
 	d.netController, err = d.initNetworkController(config)
 	if err != nil {
 		return nil, fmt.Errorf("Error initializing network controller: %v", err)
 	}
-
-	graphdbPath := filepath.Join(config.Root, "linkgraph.db")
-	graph, err := graphdb.NewSqliteConn(graphdbPath)
-	if err != nil {
-		return nil, err
-	}
-
-	d.containerGraphDB = graph
 
 	sysInfo := sysinfo.New(false)
 	// Check if Devices cgroup is mounted, it is hard requirement for container security,
@@ -844,7 +789,7 @@ func NewDaemon(config *Config, registryService *registry.Service) (daemon *Daemo
 
 	d.ID = trustKey.PublicKey().KeyID()
 	d.repository = daemonRepo
-	d.containers = &contStore{s: make(map[string]*container.Container)}
+	d.containers = container.NewMemoryStore()
 	d.execCommands = exec.NewStore()
 	d.referenceStore = referenceStore
 	d.distributionMetadataStore = distributionMetadataStore
@@ -853,18 +798,24 @@ func NewDaemon(config *Config, registryService *registry.Service) (daemon *Daemo
 	d.configStore = config
 	d.execDriver = ed
 	d.statsCollector = d.newStatsCollector(1 * time.Second)
-	d.defaultLogConfig = config.LogConfig
+	d.defaultLogConfig = containertypes.LogConfig{
+		Type:   config.LogConfig.Type,
+		Config: config.LogConfig.Config,
+	}
 	d.RegistryService = registryService
 	d.EventsService = eventsService
 	d.volumes = volStore
 	d.root = config.Root
 	d.uidMaps = uidMaps
 	d.gidMaps = gidMaps
+	d.seccompEnabled = sysInfo.Seccomp
+
+	d.nameIndex = registrar.NewRegistrar()
+	d.linkIndex = newLinkIndex()
 
 	if err := d.cleanupMounts(); err != nil {
 		return nil, err
 	}
-
 	go d.execCommandGC()
 
 	if err := d.restore(); err != nil {
@@ -917,35 +868,23 @@ func (daemon *Daemon) shutdownContainer(c *container.Container) error {
 func (daemon *Daemon) Shutdown() error {
 	daemon.shutdown = true
 	if daemon.containers != nil {
-		group := sync.WaitGroup{}
 		logrus.Debug("starting clean shutdown of all containers...")
-		for _, cont := range daemon.List() {
-			if !cont.IsRunning() {
-				continue
+		daemon.containers.ApplyAll(func(c *container.Container) {
+			if !c.IsRunning() {
+				return
 			}
-			logrus.Debugf("stopping %s", cont.ID)
-			group.Add(1)
-			go func(c *container.Container) {
-				defer group.Done()
-				if err := daemon.shutdownContainer(c); err != nil {
-					logrus.Errorf("Stop container error: %v", err)
-					return
-				}
-				logrus.Debugf("container stopped %s", c.ID)
-			}(cont)
-		}
-		group.Wait()
+			logrus.Debugf("stopping %s", c.ID)
+			if err := daemon.shutdownContainer(c); err != nil {
+				logrus.Errorf("Stop container error: %v", err)
+				return
+			}
+			logrus.Debugf("container stopped %s", c.ID)
+		})
 	}
 
 	// trigger libnetwork Stop only if it's initialized
 	if daemon.netController != nil {
 		daemon.netController.Stop()
-	}
-
-	if daemon.containerGraphDB != nil {
-		if err := daemon.containerGraphDB.Close(); err != nil {
-			logrus.Errorf("Error during container graph.Close(): %v", err)
-		}
 	}
 
 	if daemon.layerStore != nil {
@@ -1022,8 +961,8 @@ func (daemon *Daemon) changes(container *container.Container) ([]archive.Change,
 	return container.RWLayer.Changes()
 }
 
-// TagImage creates a tag in the repository reponame, pointing to the image named
-// imageName.
+// TagImage creates the tag specified by newTag, pointing to the image named
+// imageName (alternatively, imageName can also be an image ID).
 func (daemon *Daemon) TagImage(newTag reference.Named, imageName string) error {
 	imageID, err := daemon.GetImageID(imageName)
 	if err != nil {
@@ -1032,7 +971,8 @@ func (daemon *Daemon) TagImage(newTag reference.Named, imageName string) error {
 	if err := daemon.referenceStore.AddTag(newTag, imageID, true); err != nil {
 		return err
 	}
-	daemon.EventsService.Log("tag", newTag.String(), "")
+
+	daemon.LogImageEvent(imageID.String(), newTag.String(), "tag")
 	return nil
 }
 
@@ -1042,13 +982,28 @@ func writeDistributionProgress(cancelFunc func(), outStream io.Writer, progressC
 
 	for prog := range progressChan {
 		if err := progressOutput.WriteProgress(prog); err != nil && !operationCancelled {
-			logrus.Errorf("error writing progress to client: %v", err)
+			// don't log broken pipe errors as this is the normal case when a client aborts
+			if isBrokenPipe(err) {
+				logrus.Info("Pull session cancelled")
+			} else {
+				logrus.Errorf("error writing progress to client: %v", err)
+			}
 			cancelFunc()
 			operationCancelled = true
 			// Don't return, because we need to continue draining
 			// progressChan until it's closed to avoid a deadlock.
 		}
 	}
+}
+
+func isBrokenPipe(e error) bool {
+	if netErr, ok := e.(*net.OpError); ok {
+		e = netErr.Err
+		if sysErr, ok := netErr.Err.(*os.SyscallError); ok {
+			e = sysErr.Err
+		}
+	}
+	return e == syscall.EPIPE
 }
 
 // PullImage initiates a pull operation. image is the repository name to pull, and
@@ -1068,21 +1023,50 @@ func (daemon *Daemon) PullImage(ref reference.Named, metaHeaders map[string][]st
 	}()
 
 	imagePullConfig := &distribution.ImagePullConfig{
-		MetaHeaders:     metaHeaders,
-		AuthConfig:      authConfig,
-		ProgressOutput:  progress.ChanOutput(progressChan),
-		RegistryService: daemon.RegistryService,
-		EventsService:   daemon.EventsService,
-		MetadataStore:   daemon.distributionMetadataStore,
-		ImageStore:      daemon.imageStore,
-		ReferenceStore:  daemon.referenceStore,
-		DownloadManager: daemon.downloadManager,
+		MetaHeaders:      metaHeaders,
+		AuthConfig:       authConfig,
+		ProgressOutput:   progress.ChanOutput(progressChan),
+		RegistryService:  daemon.RegistryService,
+		ImageEventLogger: daemon.LogImageEvent,
+		MetadataStore:    daemon.distributionMetadataStore,
+		ImageStore:       daemon.imageStore,
+		ReferenceStore:   daemon.referenceStore,
+		DownloadManager:  daemon.downloadManager,
 	}
 
 	err := distribution.Pull(ctx, ref, imagePullConfig)
 	close(progressChan)
 	<-writesDone
 	return err
+}
+
+// PullOnBuild tells Docker to pull image referenced by `name`.
+func (daemon *Daemon) PullOnBuild(name string, authConfigs map[string]types.AuthConfig, output io.Writer) (builder.Image, error) {
+	ref, err := reference.ParseNamed(name)
+	if err != nil {
+		return nil, err
+	}
+	ref = reference.WithDefaultTag(ref)
+
+	pullRegistryAuth := &types.AuthConfig{}
+	if len(authConfigs) > 0 {
+		// The request came with a full auth config file, we prefer to use that
+		repoInfo, err := daemon.RegistryService.ResolveRepository(ref)
+		if err != nil {
+			return nil, err
+		}
+
+		resolvedConfig := registry.ResolveAuthConfig(
+			authConfigs,
+			repoInfo.Index,
+		)
+		pullRegistryAuth = &resolvedConfig
+	}
+
+	if err := daemon.PullImage(ref, nil, pullRegistryAuth, output); err != nil {
+		return nil, err
+	}
+	return daemon.GetImage(name)
 }
 
 // ExportImage exports a list of images to the given output stream. The
@@ -1111,17 +1095,17 @@ func (daemon *Daemon) PushImage(ref reference.Named, metaHeaders map[string][]st
 	}()
 
 	imagePushConfig := &distribution.ImagePushConfig{
-		MetaHeaders:     metaHeaders,
-		AuthConfig:      authConfig,
-		ProgressOutput:  progress.ChanOutput(progressChan),
-		RegistryService: daemon.RegistryService,
-		EventsService:   daemon.EventsService,
-		MetadataStore:   daemon.distributionMetadataStore,
-		LayerStore:      daemon.layerStore,
-		ImageStore:      daemon.imageStore,
-		ReferenceStore:  daemon.referenceStore,
-		TrustKey:        daemon.trustKey,
-		UploadManager:   daemon.uploadManager,
+		MetaHeaders:      metaHeaders,
+		AuthConfig:       authConfig,
+		ProgressOutput:   progress.ChanOutput(progressChan),
+		RegistryService:  daemon.RegistryService,
+		ImageEventLogger: daemon.LogImageEvent,
+		MetadataStore:    daemon.distributionMetadataStore,
+		LayerStore:       daemon.layerStore,
+		ImageStore:       daemon.imageStore,
+		ReferenceStore:   daemon.referenceStore,
+		TrustKey:         daemon.trustKey,
+		UploadManager:    daemon.uploadManager,
 	}
 
 	err := distribution.Push(ctx, ref, imagePushConfig)
@@ -1286,6 +1270,9 @@ func (daemon *Daemon) ImageHistory(name string) ([]*types.ImageHistory, error) {
 func (daemon *Daemon) GetImageID(refOrID string) (image.ID, error) {
 	// Treat as an ID
 	if id, err := digest.ParseDigest(refOrID); err == nil {
+		if _, err := daemon.imageStore.Get(image.ID(id)); err != nil {
+			return "", ErrImageDoesNotExist{refOrID}
+		}
 		return image.ID(id), nil
 	}
 
@@ -1322,6 +1309,15 @@ func (daemon *Daemon) GetImage(refOrID string) (*image.Image, error) {
 	return daemon.imageStore.Get(imgID)
 }
 
+// GetImageOnBuild looks up a Docker image referenced by `name`.
+func (daemon *Daemon) GetImageOnBuild(name string) (builder.Image, error) {
+	img, err := daemon.GetImage(name)
+	if err != nil {
+		return nil, err
+	}
+	return img, nil
+}
+
 // GraphDriverName returns the name of the graph driver used by the layer.Store
 func (daemon *Daemon) GraphDriverName() string {
 	return daemon.layerStore.DriverName()
@@ -1331,10 +1327,6 @@ func (daemon *Daemon) GraphDriverName() string {
 // starting execs in a container.
 func (daemon *Daemon) ExecutionDriver() execdriver.Driver {
 	return daemon.execDriver
-}
-
-func (daemon *Daemon) containerGraph() *graphdb.Database {
-	return daemon.containerGraphDB
 }
 
 // GetUIDGIDMaps returns the current daemon's user namespace settings
@@ -1352,35 +1344,55 @@ func (daemon *Daemon) GetRemappedUIDGID() (int, int) {
 	return uid, gid
 }
 
-// ImageGetCached returns the earliest created image that is a child
+// GetCachedImage returns the most recent created image that is a child
 // of the image with imgID, that had the same config when it was
 // created. nil is returned if a child cannot be found. An error is
 // returned if the parent image cannot be found.
-func (daemon *Daemon) ImageGetCached(imgID image.ID, config *containertypes.Config) (*image.Image, error) {
-	// Retrieve all images
-	imgs := daemon.Map()
-
-	var siblings []image.ID
-	for id, img := range imgs {
-		if img.Parent == imgID {
-			siblings = append(siblings, id)
-		}
-	}
-
+func (daemon *Daemon) GetCachedImage(imgID image.ID, config *containertypes.Config) (*image.Image, error) {
 	// Loop on the children of the given image and check the config
-	var match *image.Image
-	for _, id := range siblings {
-		img, ok := imgs[id]
-		if !ok {
-			return nil, fmt.Errorf("unable to find image %q", id)
-		}
-		if runconfig.Compare(&img.ContainerConfig, config) {
-			if match == nil || match.Created.Before(img.Created) {
-				match = img
+	getMatch := func(siblings []image.ID) (*image.Image, error) {
+		var match *image.Image
+		for _, id := range siblings {
+			img, err := daemon.imageStore.Get(id)
+			if err != nil {
+				return nil, fmt.Errorf("unable to find image %q", id)
+			}
+
+			if runconfig.Compare(&img.ContainerConfig, config) {
+				// check for the most up to date match
+				if match == nil || match.Created.Before(img.Created) {
+					match = img
+				}
 			}
 		}
+		return match, nil
 	}
-	return match, nil
+
+	// In this case, this is `FROM scratch`, which isn't an actual image.
+	if imgID == "" {
+		images := daemon.imageStore.Map()
+		var siblings []image.ID
+		for id, img := range images {
+			if img.Parent == imgID {
+				siblings = append(siblings, id)
+			}
+		}
+		return getMatch(siblings)
+	}
+
+	// find match from child images
+	siblings := daemon.imageStore.Children(imgID)
+	return getMatch(siblings)
+}
+
+// GetCachedImageOnBuild returns a reference to a cached image whose parent equals `parent`
+// and runconfig equals `cfg`. A cache miss is expected to return an empty ID and a nil error.
+func (daemon *Daemon) GetCachedImageOnBuild(imgID string, cfg *containertypes.Config) (string, error) {
+	cache, err := daemon.GetCachedImage(image.ID(imgID), cfg)
+	if cache == nil || err != nil {
+		return "", err
+	}
+	return cache.ID().String(), nil
 }
 
 // tempDir returns the default directory to use for temporary files.
@@ -1413,9 +1425,14 @@ func (daemon *Daemon) setHostConfig(container *container.Container, hostConfig *
 		return err
 	}
 
+	// make sure links is not nil
+	// this ensures that on the next daemon restart we don't try to migrate from legacy sqlite links
+	if hostConfig.Links == nil {
+		hostConfig.Links = []string{}
+	}
+
 	container.HostConfig = hostConfig
-	container.ToDisk()
-	return nil
+	return container.ToDisk()
 }
 
 func (daemon *Daemon) setupInitLayer(initPath string) error {
@@ -1473,6 +1490,18 @@ func (daemon *Daemon) verifyContainerSettings(hostConfig *containertypes.HostCon
 	return verifyPlatformContainerSettings(daemon, hostConfig, config)
 }
 
+// Checks if the client set configurations for more than one network while creating a container
+func (daemon *Daemon) verifyNetworkingConfig(nwConfig *networktypes.NetworkingConfig) error {
+	if nwConfig == nil || len(nwConfig.EndpointsConfig) <= 1 {
+		return nil
+	}
+	l := make([]string, 0, len(nwConfig.EndpointsConfig))
+	for k := range nwConfig.EndpointsConfig {
+		l = append(l, k)
+	}
+	return derr.ErrorCodeMultipleNetworkConnect.WithArgs(fmt.Sprintf("%v", l))
+}
+
 func configureVolumes(config *Config, rootUID, rootGID int) (*store.VolumeStore, error) {
 	volumesDriver, err := local.New(config.Root, rootUID, rootGID)
 	if err != nil {
@@ -1480,15 +1509,12 @@ func configureVolumes(config *Config, rootUID, rootGID int) (*store.VolumeStore,
 	}
 
 	volumedrivers.Register(volumesDriver, volumesDriver.Name())
-	s := store.New()
-	s.AddAll(volumesDriver.List())
-
-	return s, nil
+	return store.New(), nil
 }
 
 // AuthenticateToRegistry checks the validity of credentials in authConfig
 func (daemon *Daemon) AuthenticateToRegistry(authConfig *types.AuthConfig) (string, error) {
-	return daemon.RegistryService.Auth(authConfig)
+	return daemon.RegistryService.Auth(authConfig, dockerversion.DockerUserAgent())
 }
 
 // SearchRegistryForImages queries the registry for images matching
@@ -1496,7 +1522,7 @@ func (daemon *Daemon) AuthenticateToRegistry(authConfig *types.AuthConfig) (stri
 func (daemon *Daemon) SearchRegistryForImages(term string,
 	authConfig *types.AuthConfig,
 	headers map[string][]string) (*registrytypes.SearchResults, error) {
-	return daemon.RegistryService.Search(term, authConfig, headers)
+	return daemon.RegistryService.Search(term, authConfig, dockerversion.DockerUserAgent(), headers)
 }
 
 // IsShuttingDown tells whether the daemon is shutting down or not
@@ -1546,6 +1572,75 @@ func (daemon *Daemon) getNetworkStats(c *container.Container) ([]*libcontainer.N
 // configuration based on the root storage from the daemon.
 func (daemon *Daemon) newBaseContainer(id string) *container.Container {
 	return container.NewBaseContainer(id, daemon.containerRoot(id))
+}
+
+// initDiscovery initializes the discovery watcher for this daemon.
+func (daemon *Daemon) initDiscovery(config *Config) error {
+	advertise, err := parseClusterAdvertiseSettings(config.ClusterStore, config.ClusterAdvertise)
+	if err != nil {
+		if err == errDiscoveryDisabled {
+			return nil
+		}
+		return err
+	}
+
+	config.ClusterAdvertise = advertise
+	discoveryWatcher, err := initDiscovery(config.ClusterStore, config.ClusterAdvertise, config.ClusterOpts)
+	if err != nil {
+		return fmt.Errorf("discovery initialization failed (%v)", err)
+	}
+
+	daemon.discoveryWatcher = discoveryWatcher
+	return nil
+}
+
+// Reload reads configuration changes and modifies the
+// daemon according to those changes.
+// This are the settings that Reload changes:
+// - Daemon labels.
+func (daemon *Daemon) Reload(config *Config) error {
+	daemon.configStore.reloadLock.Lock()
+	daemon.configStore.Labels = config.Labels
+	daemon.configStore.reloadLock.Unlock()
+
+	return nil
+}
+
+func (daemon *Daemon) reloadClusterDiscovery(config *Config) error {
+	newAdvertise, err := parseClusterAdvertiseSettings(config.ClusterStore, config.ClusterAdvertise)
+	if err != nil && err != errDiscoveryDisabled {
+		return err
+	}
+
+	// check discovery modifications
+	if !modifiedDiscoverySettings(daemon.configStore, newAdvertise, config.ClusterStore, config.ClusterOpts) {
+		return nil
+	}
+
+	// enable discovery for the first time if it was not previously enabled
+	if daemon.discoveryWatcher == nil {
+		discoveryWatcher, err := initDiscovery(config.ClusterStore, newAdvertise, config.ClusterOpts)
+		if err != nil {
+			return fmt.Errorf("discovery initialization failed (%v)", err)
+		}
+		daemon.discoveryWatcher = discoveryWatcher
+	} else {
+		if err == errDiscoveryDisabled {
+			// disable discovery if it was previously enabled and it's disabled now
+			daemon.discoveryWatcher.Stop()
+		} else {
+			// reload discovery
+			if err = daemon.discoveryWatcher.Reload(config.ClusterStore, newAdvertise, config.ClusterOpts); err != nil {
+				return err
+			}
+		}
+	}
+
+	daemon.configStore.ClusterStore = config.ClusterStore
+	daemon.configStore.ClusterOpts = config.ClusterOpts
+	daemon.configStore.ClusterAdvertise = newAdvertise
+
+	return nil
 }
 
 func convertLnNetworkStats(name string, stats *lntypes.InterfaceStatistics) *libcontainer.NetworkInterface {

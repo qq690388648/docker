@@ -27,6 +27,7 @@
 
 		people = [
 			"calavera",
+			"coolljt0725",
 			"cpuguy83",
 			"crosbymichael",
 			"duglin",
@@ -34,9 +35,11 @@
 			"icecrime",
 			"jfrazelle",
 			"lk4d4",
+			"mhbauer",
 			"runcom",
 			"tianon",
 			"tibor",
+			"tonistiigi",
 			"unclejack",
 			"vbatts",
 			"vdemeester"
@@ -113,6 +116,11 @@
 	Email = "david.calavera@gmail.com"
 	GitHub = "calavera"
 
+	[people.coolljt0725]
+	Name = "Lei Jitang"
+	Email = "leijitang@huawei.com"
+	GitHub = "coolljt0725"
+
 	[people.cpuguy83]
 	Name = "Brian Goff"
 	Email = "cpuguy83@gmail.com"
@@ -122,6 +130,7 @@
 	Name = "Michael Crosby"
 	Email = "crosbymichael@gmail.com"
 	GitHub = "crosbymichael"
+
 	[people.duglin]
 	Name = "Doug Davis"
 	Email = "dug@us.ibm.com"
@@ -157,6 +166,11 @@
 	Email = "lk4d4@docker.com"
 	GitHub = "lk4d4"
 
+	[people.mhbauer]
+	Name = "Morgan Bauer"
+	Email = "mbauer@us.ibm.com"
+	GitHub = "mhbauer"
+
 	[people.moxiegirl]
 	Name = "Mary Anthony"
 	Email = "mary.anthony@docker.com"
@@ -164,7 +178,7 @@
 
 	[people.runcom]
 	Name = "Antonio Murdaca"
-	Email = "me@runcom.ninja"
+	Email = "runcom@redhat.com"
 	GitHub = "runcom"
 
 	[people.shykes]
@@ -196,6 +210,11 @@
 	Name = "Tibor Vass"
 	Email = "tibor@docker.com"
 	GitHub = "tiborvass"
+
+	[people.tonistiigi]
+	Name = "Tõnis Tiigi"
+	Email = "tonis@docker.com"
+	GitHub = "tonistiigi"
 
 	[people.unclejack]
 	Name = "Cristian Staretu"

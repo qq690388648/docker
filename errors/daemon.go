@@ -46,6 +46,15 @@ var (
 		HTTPStatusCode: http.StatusInternalServerError,
 	})
 
+	// ErrorCodeRemovalContainer is generated when we attempt to connect or disconnect a
+	// container but it's marked for removal.
+	ErrorCodeRemovalContainer = errcode.Register(errGroup, errcode.ErrorDescriptor{
+		Value:          "REMOVALCONTAINER",
+		Message:        "Container %s is marked for removal and cannot be connected or disconnected to the network",
+		Description:    "The specified container is marked for removal and cannot be connected or disconnected to the network",
+		HTTPStatusCode: http.StatusInternalServerError,
+	})
+
 	// ErrorCodePausedContainer is generated when we attempt to attach a
 	// container but its paused.
 	ErrorCodePausedContainer = errcode.Register(errGroup, errcode.ErrorDescriptor{
@@ -724,6 +733,15 @@ var (
 		HTTPStatusCode: http.StatusConflict,
 	})
 
+	// ErrorCodeExecRestarting is generated when we try to start an exec
+	// but the container is restarting.
+	ErrorCodeExecRestarting = errcode.Register(errGroup, errcode.ErrorDescriptor{
+		Value:          "EXECRESTARTING",
+		Message:        "Container %s is restarting, wait until the container is running",
+		Description:    "An attempt to start an 'exec' was made, but the owning container is restarting",
+		HTTPStatusCode: http.StatusConflict,
+	})
+
 	// ErrorCodeExecRunning is generated when we try to start an exec
 	// but its already running.
 	ErrorCodeExecRunning = errcode.Register(errGroup, errcode.ErrorDescriptor{
@@ -731,6 +749,15 @@ var (
 		Message:        "Error: Exec command %s is already running",
 		Description:    "An attempt to start an 'exec' was made, but 'exec' is already running",
 		HTTPStatusCode: http.StatusInternalServerError,
+	})
+
+	// ErrorCodeExecExited is generated when we try to start an exec
+	// but its already running.
+	ErrorCodeExecExited = errcode.Register(errGroup, errcode.ErrorDescriptor{
+		Value:          "EXECEXITED",
+		Message:        "Error: Exec command %s has already run",
+		Description:    "An attempt to start an 'exec' was made, but 'exec' was already run",
+		HTTPStatusCode: http.StatusConflict,
 	})
 
 	// ErrorCodeExecCantRun is generated when we try to start an exec
@@ -908,7 +935,7 @@ var (
 	// trying to create a volume that has existed using different driver.
 	ErrorVolumeNameTaken = errcode.Register(errGroup, errcode.ErrorDescriptor{
 		Value:          "VOLUME_NAME_TAKEN",
-		Message:        "A volume named %q already exists with the %q driver. Choose a different volume name.",
+		Message:        "A volume named %s already exists. Choose a different volume name.",
 		Description:    "An attempt to create a volume using a driver but the volume already exists with a different driver",
 		HTTPStatusCode: http.StatusInternalServerError,
 	})
@@ -938,5 +965,23 @@ var (
 		Message:        "Cannot start container %s: %s",
 		Description:    "There was an error while trying to start a container",
 		HTTPStatusCode: http.StatusInternalServerError,
+	})
+
+	// ErrorCodeCantDeletePredefinedNetwork is generated when one of the predefined networks
+	// is attempted to be deleted.
+	ErrorCodeCantDeletePredefinedNetwork = errcode.Register(errGroup, errcode.ErrorDescriptor{
+		Value:          "CANT_DELETE_PREDEFINED_NETWORK",
+		Message:        "%s is a pre-defined network and cannot be removed",
+		Description:    "Engine's predefined networks cannot be deleted",
+		HTTPStatusCode: http.StatusForbidden,
+	})
+
+	// ErrorCodeMultipleNetworkConnect is generated when more than one network is passed
+	// when creating a container
+	ErrorCodeMultipleNetworkConnect = errcode.Register(errGroup, errcode.ErrorDescriptor{
+		Value:          "CANNOT_CONNECT_TO_MULTIPLE_NETWORKS",
+		Message:        "Container cannot be connected to %s",
+		Description:    "A container can only be connected to one network at the time",
+		HTTPStatusCode: http.StatusBadRequest,
 	})
 )

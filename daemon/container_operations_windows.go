@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/daemon/execdriver/windows"
 	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/layer"
+	networktypes "github.com/docker/engine-api/types/network"
 	"github.com/docker/libnetwork"
 )
 
@@ -18,7 +19,7 @@ func (daemon *Daemon) setupLinkedContainers(container *container.Container) ([]s
 }
 
 // updateContainerNetworkSettings update the network settings
-func (daemon *Daemon) updateContainerNetworkSettings(container *container.Container) error {
+func (daemon *Daemon) updateContainerNetworkSettings(container *container.Container, endpointsConfig map[string]*networktypes.EndpointSettings) error {
 	return nil
 }
 
@@ -27,12 +28,17 @@ func (daemon *Daemon) initializeNetworking(container *container.Container) error
 }
 
 // ConnectToNetwork connects a container to the network
-func (daemon *Daemon) ConnectToNetwork(container *container.Container, idOrName string) error {
+func (daemon *Daemon) ConnectToNetwork(container *container.Container, idOrName string, endpointConfig *networktypes.EndpointSettings) error {
+	return nil
+}
+
+// ForceEndpointDelete deletes an endpoing from a network forcefully
+func (daemon *Daemon) ForceEndpointDelete(name string, n libnetwork.Network) error {
 	return nil
 }
 
 // DisconnectFromNetwork disconnects a container from the network.
-func (daemon *Daemon) DisconnectFromNetwork(container *container.Container, n libnetwork.Network) error {
+func (daemon *Daemon) DisconnectFromNetwork(container *container.Container, n libnetwork.Network, force bool) error {
 	return nil
 }
 
@@ -48,7 +54,7 @@ func (daemon *Daemon) populateCommand(c *container.Container, env []string) erro
 		if !c.Config.NetworkDisabled {
 			en.Interface = &execdriver.NetworkInterface{
 				MacAddress:   c.Config.MacAddress,
-				Bridge:       daemon.configStore.Bridge.VirtualSwitchName,
+				Bridge:       daemon.configStore.bridgeConfig.VirtualSwitchName,
 				PortBindings: c.HostConfig.PortBindings,
 
 				// TODO Windows. Include IPAddress. There already is a
@@ -118,7 +124,6 @@ func (daemon *Daemon) populateCommand(c *container.Container, env []string) erro
 		CommonCommand: execdriver.CommonCommand{
 			ID:            c.ID,
 			Rootfs:        c.BaseFS,
-			InitPath:      "/.dockerinit",
 			WorkingDir:    c.Config.WorkingDir,
 			Network:       en,
 			MountLabel:    c.GetMountLabel(),

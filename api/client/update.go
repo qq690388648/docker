@@ -2,10 +2,11 @@ package client
 
 import (
 	"fmt"
+	"strings"
 
-	"github.com/docker/docker/api/types/container"
 	Cli "github.com/docker/docker/cli"
 	flag "github.com/docker/docker/pkg/mflag"
+	"github.com/docker/engine-api/types/container"
 	"github.com/docker/go-units"
 )
 
@@ -22,7 +23,7 @@ func (cli *DockerCli) CmdUpdate(args ...string) error {
 	flCPUShares := cmd.Int64([]string{"#c", "-cpu-shares"}, 0, "CPU shares (relative weight)")
 	flMemoryString := cmd.String([]string{"m", "-memory"}, "", "Memory limit")
 	flMemoryReservation := cmd.String([]string{"-memory-reservation"}, "", "Memory soft limit")
-	flMemorySwap := cmd.String([]string{"-memory-swap"}, "", "Total memory (memory + swap), '-1' to disable swap")
+	flMemorySwap := cmd.String([]string{"-memory-swap"}, "", "Swap limit equal to memory plus swap: '-1' to enable unlimited swap")
 	flKernelMemory := cmd.String([]string{"-kernel-memory"}, "", "Kernel memory limit")
 
 	cmd.Require(flag.Min, 1)
@@ -81,23 +82,22 @@ func (cli *DockerCli) CmdUpdate(args ...string) error {
 		CPUQuota:          *flCPUQuota,
 	}
 
-	hostConfig := container.HostConfig{
+	updateConfig := container.UpdateConfig{
 		Resources: resources,
 	}
 
 	names := cmd.Args()
-	var errNames []string
+	var errs []string
 	for _, name := range names {
-		if err := cli.client.ContainerUpdate(name, hostConfig); err != nil {
-			fmt.Fprintf(cli.err, "%s\n", err)
-			errNames = append(errNames, name)
+		if err := cli.client.ContainerUpdate(name, updateConfig); err != nil {
+			errs = append(errs, fmt.Sprintf("Failed to update container (%s): %s", name, err))
 		} else {
 			fmt.Fprintf(cli.out, "%s\n", name)
 		}
 	}
 
-	if len(errNames) > 0 {
-		return fmt.Errorf("Error: failed to update resources of containers: %v", errNames)
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "\n"))
 	}
 
 	return nil

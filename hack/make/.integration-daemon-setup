@@ -1,13 +1,13 @@
 #!/bin/bash
+set -e
 
-# Retrieve OS/ARCH of docker daemon, eg. linux/amd64
-export DOCKER_ENGINE_OSARCH=$(docker version | grep 'OS/Arch' | tail -1 | cut -d':' -f2 | tr -d '[[:space:]]')
-# Retrieve OS of docker daemon, eg. linux
-export DOCKER_ENGINE_GOOS=$(echo $DOCKER_ENGINE_OSARCH | cut -d'/' -f1)
-# Retrieve ARCH of docker daemon, eg. amd64
-export DOCKER_ENGINE_GOARCH=$(echo $DOCKER_ENGINE_OSARCH | cut -d'/' -f2)
-
-bundle .ensure-emptyfs
-bundle .ensure-frozen-images
-bundle .ensure-httpserver
-bundle .ensure-userns-test
+bundle .detect-daemon-osarch
+if [ $DOCKER_ENGINE_GOOS != "windows" ]; then
+	bundle .ensure-emptyfs
+	bundle .ensure-frozen-images
+	bundle .ensure-httpserver
+	bundle .ensure-syscall-test
+else
+	# Note this is Windows to Windows CI, not Windows to Linux CI
+	bundle .ensure-frozen-images-windows
+fi

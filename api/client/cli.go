@@ -9,12 +9,12 @@ import (
 	"runtime"
 
 	"github.com/docker/docker/api"
-	"github.com/docker/docker/api/client/lib"
 	"github.com/docker/docker/cli"
 	"github.com/docker/docker/cliconfig"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/term"
+	"github.com/docker/engine-api/client"
 	"github.com/docker/go-connections/tlsconfig"
 )
 
@@ -43,7 +43,9 @@ type DockerCli struct {
 	// isTerminalOut indicates whether the client's STDOUT is a TTY
 	isTerminalOut bool
 	// client is the http client that performs all API operations
-	client apiClient
+	client client.APIClient
+	// state holds the terminal state
+	state *term.State
 }
 
 // Initialize calls the init function that will setup the configuration for the client
@@ -77,6 +79,31 @@ func (cli *DockerCli) PsFormat() string {
 // String contains columns and format specification, for example {{ID}}\t{{Name}}.
 func (cli *DockerCli) ImagesFormat() string {
 	return cli.configFile.ImagesFormat
+}
+
+func (cli *DockerCli) setRawTerminal() error {
+	if cli.isTerminalIn && os.Getenv("NORAW") == "" {
+		state, err := term.SetRawTerminal(cli.inFd)
+		if err != nil {
+			return err
+		}
+		cli.state = state
+	}
+	return nil
+}
+
+func (cli *DockerCli) restoreTerminal(in io.Closer) error {
+	if cli.state != nil {
+		term.RestoreTerminal(cli.inFd, cli.state)
+	}
+	// WARNING: DO NOT REMOVE THE OS CHECK !!!
+	// For some reason this Close call blocks on darwin..
+	// As the client exists right after, simply discard the close
+	// until we find a better solution.
+	if in != nil && runtime.GOOS != "darwin" {
+		return in.Close()
+	}
+	return nil
 }
 
 // NewDockerCli returns a DockerCli instance with IO output and error streams set by in, out and err.
@@ -120,7 +147,7 @@ func NewDockerCli(in io.ReadCloser, out, err io.Writer, clientFlags *cli.ClientF
 			return err
 		}
 
-		client, err := lib.NewClient(host, verStr, clientTransport, customHeaders)
+		client, err := client.NewClient(host, verStr, clientTransport, customHeaders)
 		if err != nil {
 			return err
 		}
@@ -149,12 +176,7 @@ func getServerHost(hosts []string, tlsOptions *tlsconfig.Options) (host string, 
 		return "", errors.New("Please specify only one -H")
 	}
 
-	defaultHost := opts.DefaultTCPHost
-	if tlsOptions != nil {
-		defaultHost = opts.DefaultTLSHost
-	}
-
-	host, err = opts.ParseHost(defaultHost, host)
+	host, err = opts.ParseHost(tlsOptions != nil, host)
 	return
 }
 

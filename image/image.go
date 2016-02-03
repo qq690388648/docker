@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/docker/distribution/digest"
-	"github.com/docker/docker/api/types/container"
+	"github.com/docker/engine-api/types/container"
 )
 
 // ID is the content-addressable ID of an image.
@@ -68,6 +68,16 @@ func (img *Image) RawJSON() []byte {
 // ID returns the image's content-addressable ID.
 func (img *Image) ID() ID {
 	return img.computedID
+}
+
+// ImageID stringizes ID.
+func (img *Image) ImageID() string {
+	return string(img.ID())
+}
+
+// RunConfig returns the image's container config.
+func (img *Image) RunConfig() *container.Config {
+	return img.Config
 }
 
 // MarshalJSON serializes the image to JSON. It sorts the top-level keys so

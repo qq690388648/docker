@@ -6,14 +6,15 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/exec"
 	"github.com/docker/docker/daemon/execdriver"
 	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/pkg/pools"
 	"github.com/docker/docker/pkg/promise"
+	"github.com/docker/docker/pkg/term"
+	"github.com/docker/engine-api/types"
+	"github.com/docker/engine-api/types/strslice"
 )
 
 func (d *Daemon) registerExecCommand(container *container.Container, config *exec.Config) {
@@ -51,6 +52,9 @@ func (d *Daemon) getExecConfig(name string) (*exec.Config, error) {
 			if container.IsPaused() {
 				return nil, derr.ErrorCodeExecPaused.WithArgs(container.ID)
 			}
+			if container.IsRestarting() {
+				return nil, derr.ErrorCodeExecRestarting.WithArgs(container.ID)
+			}
 			return ec, nil
 		}
 	}
@@ -75,6 +79,9 @@ func (d *Daemon) getActiveContainer(name string) (*container.Container, error) {
 	if container.IsPaused() {
 		return nil, derr.ErrorCodeExecPaused.WithArgs(name)
 	}
+	if container.IsRestarting() {
+		return nil, derr.ErrorCodeExecRestarting.WithArgs(name)
+	}
 	return container, nil
 }
 
@@ -87,6 +94,14 @@ func (d *Daemon) ContainerExecCreate(config *types.ExecConfig) (string, error) {
 
 	cmd := strslice.New(config.Cmd...)
 	entrypoint, args := d.getEntrypointAndArgs(strslice.New(), cmd)
+
+	keys := []byte{}
+	if config.DetachKeys != "" {
+		keys, err = term.ToBytes(config.DetachKeys)
+		if err != nil {
+			logrus.Warnf("Wrong escape keys provided (%s, error: %s) using default : ctrl-p ctrl-q", config.DetachKeys, err.Error())
+		}
+	}
 
 	processConfig := &execdriver.ProcessConfig{
 		CommonProcessConfig: execdriver.CommonProcessConfig{
@@ -103,6 +118,7 @@ func (d *Daemon) ContainerExecCreate(config *types.ExecConfig) (string, error) {
 	execConfig.OpenStderr = config.AttachStderr
 	execConfig.ProcessConfig = processConfig
 	execConfig.ContainerID = container.ID
+	execConfig.DetachKeys = keys
 
 	d.registerExecCommand(container, execConfig)
 
@@ -125,6 +141,11 @@ func (d *Daemon) ContainerExecStart(name string, stdin io.ReadCloser, stdout io.
 	}
 
 	ec.Lock()
+	if ec.ExitCode != nil {
+		ec.Unlock()
+		return derr.ErrorCodeExecExited.WithArgs(ec.ID)
+	}
+
 	if ec.Running {
 		ec.Unlock()
 		return derr.ErrorCodeExecRunning.WithArgs(ec.ID)
@@ -158,7 +179,8 @@ func (d *Daemon) ContainerExecStart(name string, stdin io.ReadCloser, stdout io.
 		ec.NewNopInputPipe()
 	}
 
-	attachErr := container.AttachStreams(ec.StreamConfig, ec.OpenStdin, true, ec.ProcessConfig.Tty, cStdin, cStdout, cStderr)
+	attachErr := container.AttachStreams(ec.StreamConfig, ec.OpenStdin, true, ec.ProcessConfig.Tty, cStdin, cStdout, cStderr, ec.DetachKeys)
+
 	execErr := make(chan error)
 
 	// Note, the ExecConfig data will be removed when the container
@@ -203,7 +225,7 @@ func (d *Daemon) Exec(c *container.Container, execConfig *exec.Config, pipes *ex
 		exitStatus = 128
 	}
 
-	execConfig.ExitCode = exitStatus
+	execConfig.ExitCode = &exitStatus
 	execConfig.Running = false
 
 	return exitStatus, err

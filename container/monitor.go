@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/daemon/execdriver"
 	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/pkg/promise"
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/utils"
+	"github.com/docker/engine-api/types/container"
 )
 
 const (
@@ -218,7 +218,7 @@ func (m *containerMonitor) start() error {
 		m.resetMonitor(err == nil && exitStatus.ExitCode == 0)
 
 		if m.shouldRestart(exitStatus.ExitCode) {
-			m.container.SetRestarting(&exitStatus)
+			m.container.SetRestartingLocking(&exitStatus)
 			m.logEvent("die")
 			m.resetContainer(true)
 
@@ -304,8 +304,7 @@ func (m *containerMonitor) shouldRestart(exitCode int) bool {
 // received ack from the execution drivers
 func (m *containerMonitor) callback(processConfig *execdriver.ProcessConfig, pid int, chOOM <-chan struct{}) error {
 	go func() {
-		_, ok := <-chOOM
-		if ok {
+		for range chOOM {
 			m.logEvent("oom")
 		}
 	}()
@@ -370,6 +369,9 @@ func (m *containerMonitor) resetContainer(lock bool) {
 			select {
 			case <-time.After(loggerCloseTimeout):
 				logrus.Warnf("Logger didn't exit in time: logs may be truncated")
+				container.LogCopier.Close()
+				// always waits for the LogCopier to finished before closing
+				<-exit
 			case <-exit:
 			}
 		}

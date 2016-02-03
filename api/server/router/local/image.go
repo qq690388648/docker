@@ -7,18 +7,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/docker/distribution/digest"
+	"github.com/docker/distribution/registry/api/errcode"
 	"github.com/docker/docker/api/server/httputils"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/builder/dockerfile"
 	derr "github.com/docker/docker/errors"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/reference"
 	"github.com/docker/docker/runconfig"
+	"github.com/docker/engine-api/types"
+	"github.com/docker/engine-api/types/container"
 	"golang.org/x/net/context"
 )
 
@@ -39,7 +41,7 @@ func (s *router) postCommit(ctx context.Context, w http.ResponseWriter, r *http.
 		pause = true
 	}
 
-	c, _, err := runconfig.DecodeContainerConfig(r.Body)
+	c, _, _, err := runconfig.DecodeContainerConfig(r.Body)
 	if err != nil && err != io.EOF { //Do not fail if body is empty.
 		return err
 	}
@@ -87,21 +89,8 @@ func (s *router) postImagesCreate(ctx context.Context, w http.ResponseWriter, r 
 		repo    = r.Form.Get("repo")
 		tag     = r.Form.Get("tag")
 		message = r.Form.Get("message")
-	)
-	authEncoded := r.Header.Get("X-Registry-Auth")
-	authConfig := &types.AuthConfig{}
-	if authEncoded != "" {
-		authJSON := base64.NewDecoder(base64.URLEncoding, strings.NewReader(authEncoded))
-		if err := json.NewDecoder(authJSON).Decode(authConfig); err != nil {
-			// for a pull it is not an error if no auth was given
-			// to increase compatibility with the existing api it is defaulting to be empty
-			authConfig = &types.AuthConfig{}
-		}
-	}
-
-	var (
-		err    error
-		output = ioutils.NewWriteFlusher(w)
+		err     error
+		output  = ioutils.NewWriteFlusher(w)
 	)
 	defer output.Close()
 
@@ -134,8 +123,25 @@ func (s *router) postImagesCreate(ctx context.Context, w http.ResponseWriter, r 
 					}
 				}
 
+				authEncoded := r.Header.Get("X-Registry-Auth")
+				authConfig := &types.AuthConfig{}
+				if authEncoded != "" {
+					authJSON := base64.NewDecoder(base64.URLEncoding, strings.NewReader(authEncoded))
+					if err := json.NewDecoder(authJSON).Decode(authConfig); err != nil {
+						// for a pull it is not an error if no auth was given
+						// to increase compatibility with the existing api it is defaulting to be empty
+						authConfig = &types.AuthConfig{}
+					}
+				}
+
 				err = s.daemon.PullImage(ref, metaHeaders, authConfig, output)
 			}
+		}
+		// Check the error from pulling an image to make sure the request
+		// was authorized. Modify the status if the request was
+		// unauthorized to respond with 401 rather than 500.
+		if err != nil && isAuthorizedError(err) {
+			err = errcode.ErrorCodeUnauthorized.WithMessage(fmt.Sprintf("Authentication is required: %s", err))
 		}
 	} else { //import
 		var newRef reference.Named
@@ -372,4 +378,17 @@ func (s *router) getImagesSearch(ctx context.Context, w http.ResponseWriter, r *
 		return err
 	}
 	return httputils.WriteJSON(w, http.StatusOK, query.Results)
+}
+
+func isAuthorizedError(err error) bool {
+	if urlError, ok := err.(*url.Error); ok {
+		err = urlError.Err
+	}
+
+	if dError, ok := err.(errcode.Error); ok {
+		if dError.ErrorCode() == errcode.ErrorCodeUnauthorized {
+			return true
+		}
+	}
+	return false
 }
